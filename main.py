@@ -8,11 +8,16 @@ original model by allowing for the dynamic addition of new words (e.g., slang)
 to the vocabulary, followed by a controlled retraining process to adapt the
 model to the new lexicon.
 
+This version enhances the neural network architecture by using a stacked
+LSTM model (two LSTM layers) to potentially capture more complex patterns
+in the text data.
+
 Key Features:
 - Object-Oriented Design: Encapsulates all functionality within a single class
   for easy state management, persistence, and usability.
 - Dynamic Vocabulary: Implements an `add_slang` method to augment the corpus,
   rebuild the vocabulary, and retrain the model.
+- Stacked LSTM Architecture: Utilizes two LSTM layers for improved learning capacity.
 - Corrected Inference: Provides a fully functional and logically sound
   `predict_next_words` method that operates correctly at the word level.
 - Persistence: Includes `save` and `load` methods to store and retrieve the
@@ -26,6 +31,7 @@ import numpy as np
 import pickle
 import heapq
 import os
+from difflib import SequenceMatcher
 from nltk.tokenize import RegexpTokenizer
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Activation
@@ -39,7 +45,7 @@ class WordPredictor:
     prediction, and dynamic vocabulary updates.
     """
 
-    def __init__(self, word_length=5, corpus_path='corpus.txt'):
+    def __init__(self, word_length=5, corpus_path='corpus_file.txt'):
         """
         Initializes the WordPredictor instance.
 
@@ -81,8 +87,8 @@ class WordPredictor:
         one-hot encoding them.
         """
         print("Preparing dataset for training...")
-        prev_words_list =
-        next_words_list =
+        prev_words_list = []
+        next_words_list = []
         for i in range(len(words) - self.word_length):
             prev_words_list.append(words[i:i + self.word_length])
             next_words_list.append(words[i + self.word_length])
@@ -102,10 +108,14 @@ class WordPredictor:
         return X, Y
 
     def _build_model(self):
-        """Builds the Keras LSTM model."""
-        print("Building LSTM model...")
+        """Builds the Keras stacked LSTM model."""
+        print("Building stacked LSTM model...")
         model = Sequential()
-        model.add(LSTM(128, input_shape=(self.word_length, self.unique_words_count)))
+        # First LSTM layer. `return_sequences=True` is essential to pass the
+        # full sequence output to the next LSTM layer.
+        model.add(LSTM(128, input_shape=(self.word_length, self.unique_words_count), return_sequences=True))
+        # Second LSTM layer.
+        model.add(LSTM(128))
         model.add(Dense(self.unique_words_count))
         model.add(Activation('softmax'))
         self.model = model
@@ -149,25 +159,66 @@ class WordPredictor:
         self.train(epochs=retrain_epochs)
         print("--- Dynamic Vocabulary Update Complete ---")
 
-    def _prepare_input_for_prediction(self, text):
+    def _find_closest_word(self, word, threshold=0.6):
+        """
+        Finds the closest word in the vocabulary using string similarity.
+        
+        Args:
+            word (str): The word to find a match for
+            threshold (float): Minimum similarity threshold (0-1)
+            
+        Returns:
+            str or None: The closest matching word, or None if no good match found
+        """
+        best_match = None
+        best_ratio = 0
+        
+        for vocab_word in self.word_to_index.keys():
+            ratio = SequenceMatcher(None, word.lower(), vocab_word.lower()).ratio()
+            if ratio > best_ratio and ratio >= threshold:
+                best_ratio = ratio
+                best_match = vocab_word
+                
+        return best_match
+
+    def _prepare_input_for_prediction(self, text, auto_correct=True):
         """
         Prepares a single text sequence for prediction by tokenizing and
         one-hot encoding it.
+        
+        Args:
+            text (str): Input text sequence
+            auto_correct (bool): Whether to auto-correct unknown words
         """
         tokenizer = RegexpTokenizer(r'\w+')
         words = tokenizer.tokenize(text.lower())
         
-        if len(words)!= self.word_length:
+        if len(words) != self.word_length:
             raise ValueError(f"Input text must contain exactly {self.word_length} words.")
 
         x_pred = np.zeros((1, self.word_length, self.unique_words_count))
+        corrected_words = []
+        
         for t, word in enumerate(words):
             if word in self.word_to_index:
                 x_pred[0, t, self.word_to_index[word]] = 1.
+                corrected_words.append(word)
             else:
-                # Handle out-of-vocabulary words in the input gracefully
-                print(f"Warning: Word '{word}' not in vocabulary. Ignoring.")
-        return x_pred
+                if auto_correct:
+                    # Try to find a close match
+                    closest_word = self._find_closest_word(word)
+                    if closest_word:
+                        x_pred[0, t, self.word_to_index[closest_word]] = 1.
+                        corrected_words.append(closest_word)
+                        print(f"Auto-corrected '{word}' to '{closest_word}'")
+                    else:
+                        print(f"Warning: Word '{word}' not in vocabulary and no close match found. Ignoring.")
+                        corrected_words.append(word)
+                else:
+                    print(f"Warning: Word '{word}' not in vocabulary. Ignoring.")
+                    corrected_words.append(word)
+        
+        return x_pred, corrected_words
 
     @staticmethod
     def _sample(preds, top_n=3):
@@ -182,28 +233,33 @@ class WordPredictor:
         # Get the indices of the top N predictions
         return heapq.nlargest(top_n, range(len(preds)), key=preds.take)
 
-    def predict_next_words(self, text, top_n=3):
+    def predict_next_words(self, text, top_n=3, auto_correct=True):
         """
         Predicts the top N most likely next words for a given text sequence.
 
         Args:
             text (str): The input text sequence. Must contain `word_length` words.
             top_n (int): The number of top predictions to return.
+            auto_correct (bool): Whether to auto-correct unknown words.
 
         Returns:
-            list: A list of the top N predicted next words.
+            tuple: (predictions, corrected_input) where predictions is a list of 
+                   the top N predicted next words and corrected_input is the 
+                   auto-corrected version of the input text.
         """
         if not self.model:
             raise RuntimeError("Model is not trained or loaded. Please train or load a model first.")
         
         try:
-            x_pred = self._prepare_input_for_prediction(text)
+            x_pred, corrected_words = self._prepare_input_for_prediction(text, auto_correct)
             preds = self.model.predict(x_pred, verbose=0)
             next_indices = self._sample(preds, top_n)
-            return [self.index_to_word[i] for i in next_indices]
+            predictions = [self.index_to_word[i] for i in next_indices]
+            corrected_input = " ".join(corrected_words)
+            return predictions, corrected_input
         except ValueError as e:
             print(f"Error during prediction: {e}")
-            return
+            return None, text
 
     def save(self, directory='word_predictor_model'):
         """
@@ -279,8 +335,8 @@ if __name__ == '__main__':
         f.write(corpus_text)
 
     # --- Step 2: Initial Training ---
-    # Instantiate the predictor. We use a smaller word_length for this small demo.
-    predictor = WordPredictor(word_length=4, corpus_path=corpus_file)
+    # Instantiate the predictor. Using the larger corpus_file.txt for better training.
+    predictor = WordPredictor(word_length=5, corpus_path='corpus_file.txt')
     # Train the model. Use fewer epochs for a quick demonstration.
     predictor.train(epochs=30)
     
@@ -290,9 +346,18 @@ if __name__ == '__main__':
     # --- Step 4: Test Prediction with the initial model ---
     print("\n--- Testing initial model ---")
     input_text = "the project gutenberg ebook"
-    predictions = predictor.predict_next_words(input_text, top_n=3)
+    predictions, corrected_input = predictor.predict_next_words(input_text, top_n=3)
     print(f"Input: '{input_text}'")
+    print(f"Corrected input: '{corrected_input}'")
     print(f"Predicted next words: {predictions}")
+    
+    # --- Test Auto-correct functionality ---
+    print("\n--- Testing auto-correct functionality ---")
+    typo_text = "the projct gutenbrg ebook"  # Contains typos
+    predictions_typo, corrected_typo = predictor.predict_next_words(typo_text, top_n=3)
+    print(f"Input with typos: '{typo_text}'")
+    print(f"Auto-corrected: '{corrected_typo}'")
+    print(f"Predicted next words: {predictions_typo}")
 
     # --- Step 5: Add a new slang word and retrain ---
     # Let's imagine we want to add the slang 'yeet' and some context.
@@ -303,8 +368,9 @@ if __name__ == '__main__':
     print("\n--- Testing updated model with new vocabulary ---")
     # A new prediction that might now involve the word 'yeet'
     input_text_new = "one does not simply"
-    predictions_new = predictor.predict_next_words(input_text_new, top_n=3)
+    predictions_new, corrected_new = predictor.predict_next_words(input_text_new, top_n=3)
     print(f"Input: '{input_text_new}'")
+    print(f"Corrected input: '{corrected_new}'")
     print(f"Predicted next words: {predictions_new}")
 
     # --- Step 7: Demonstrate loading the model from disk ---
@@ -313,6 +379,7 @@ if __name__ == '__main__':
     loaded_predictor = WordPredictor.load('my_word_model') # Load the first saved model
     
     # Predictions from the loaded model should match the initial model
-    loaded_predictions = loaded_predictor.predict_next_words(input_text, top_n=3)
+    loaded_predictions, loaded_corrected = loaded_predictor.predict_next_words(input_text, top_n=3)
     print(f"Input (loaded model): '{input_text}'")
+    print(f"Corrected input (loaded model): '{loaded_corrected}'")
     print(f"Predicted next words (loaded model): {loaded_predictions}")
